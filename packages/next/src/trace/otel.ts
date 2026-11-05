@@ -1,5 +1,5 @@
-// Node-only local capture and clock/worker adapter. API/SDK work belongs to the
-// deferred consumer; local recording remains independent of app sampling.
+// Node-only local capture and clock/worker adapter. Selected reporting uses the
+// application SDK inline after registration; local files never depend on sampling.
 import type { TraceEvent, ToolingSpanSelection } from './types'
 import {
   configureReporting,

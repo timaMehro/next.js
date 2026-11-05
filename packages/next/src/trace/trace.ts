@@ -82,7 +82,7 @@ function isToolingAttributeValue(value: unknown): value is AttributeValue {
 }
 
 // Direct local subscriber: the reporters consume the original tooling schema,
-// independently of request diagnostics and the optional deferred SDK adapter.
+// independently of request diagnostics and the optional application SDK adapter.
 export function reportToolingSpans(events: readonly TraceEvent[]): void {
   for (const event of events) reporter.report(event)
 }
@@ -94,7 +94,7 @@ export type LocalSpanTiming = {
 }
 
 // Source identity and clocks only: the local recorder owns the mutable payload
-// and end-once state. The deferred adapter releases its descriptor's heavy data.
+// and end-once state. The reporting adapter releases its descriptor's heavy data.
 export type ToolingSpanSource = {
   id: SpanId
   parentId?: SpanId

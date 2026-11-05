@@ -105,6 +105,28 @@ describe('tooling OTel replay', () => {
     state.end(end === undefined ? undefined : tracing.toolingSpanTime(end))
   }
 
+  it('replays the backlog at registration and reports later coarse work inline', () => {
+    const root = span(1)
+    stopSpan(span(2, 1, root))
+    expect(exported).toHaveLength(0)
+
+    installApplicationProvider()
+    backend.enableReporting()
+    expect(exported.map((entry) => entry.name)).toEqual(['operation-2'])
+
+    stopSpan(span(3, 1, root))
+    expect(exported.map((entry) => entry.name)).toEqual([
+      'operation-2',
+      'operation-3',
+    ])
+    stopSpan(root)
+    expect(exported.map((entry) => entry.name)).toEqual([
+      'operation-2',
+      'operation-3',
+      'operation-1',
+    ])
+  })
+
   it('keeps zero and detached coarse parents without a second source parent option', async () => {
     installApplicationProvider()
     tracing.initializeTraceState({
@@ -180,7 +202,7 @@ describe('tooling OTel replay', () => {
       failed: true,
       structured: '{"unicode":"世界","values":[1,2]}',
     })
-    expect(exported).toHaveLength(0)
+    expect(exported).toHaveLength(1)
     await backend.flushReporting()
     expect(exported).toHaveLength(1)
     expect(exported[0].status.code).toBe(api.SpanStatusCode.ERROR)
@@ -335,29 +357,40 @@ describe('tooling OTel replay', () => {
     expect(tracing.exportTraceState().toolingSpanSelections).toEqual([])
   })
 
-  it('replays completion-ordered worker records once under the live coordinator root', async () => {
-    const root = span(1)
-    const timestamp = Number(process.hrtime.bigint() / BigInt(1000))
-    const records: TraceEvent[] = [
-      { id: 3, parentId: 2, name: 'worker-leaf', timestamp, duration: 10 },
-      { id: 2, parentId: 1, name: 'worker-parent', timestamp, duration: 20 },
-    ]
-    backend.replayWorkerEvents(backend.freshWorkerEvents(records), records)
-    expect(backend.freshWorkerEvents(records)).toEqual([])
-    installApplicationProvider()
-    backend.enableReporting()
-    stopSpan(root)
-    expect(exported).toHaveLength(0)
-    await backend.flushReporting()
-    expect(exported).toHaveLength(3)
-    const parent = exported.find((entry) => entry.name === 'worker-parent')!
-    const leaf = exported.find((entry) => entry.name === 'worker-leaf')!
-    const coordinator = exported.find((entry) => entry.name === 'operation-1')!
-    expect(parent.parentSpanContext?.spanId).toBe(
-      coordinator.spanContext().spanId
-    )
-    expect(leaf.parentSpanContext?.spanId).toBe(parent.spanContext().spanId)
-  })
+  it.each([false, true])(
+    'replays completion-ordered worker records once under the live coordinator with registration ready=%s',
+    async (ready) => {
+      const root = span(1)
+      installApplicationProvider()
+      if (ready) backend.enableReporting()
+      const timestamp = Number(process.hrtime.bigint() / BigInt(1000))
+      const records: TraceEvent[] = [
+        { id: 3, parentId: 2, name: 'worker-leaf', timestamp, duration: 10 },
+        { id: 2, parentId: 1, name: 'worker-parent', timestamp, duration: 20 },
+      ]
+      backend.replayWorkerEvents(backend.freshWorkerEvents(records), records)
+      expect(backend.freshWorkerEvents(records)).toEqual([])
+      expect(exported).toHaveLength(ready ? 2 : 0)
+      backend.enableReporting()
+      expect(exported.map((entry) => entry.name)).toEqual([
+        'worker-parent',
+        'worker-leaf',
+      ])
+      stopSpan(root)
+      expect(exported).toHaveLength(3)
+      await backend.flushReporting()
+      expect(exported).toHaveLength(3)
+      const parent = exported.find((entry) => entry.name === 'worker-parent')!
+      const leaf = exported.find((entry) => entry.name === 'worker-leaf')!
+      const coordinator = exported.find(
+        (entry) => entry.name === 'operation-1'
+      )!
+      expect(parent.parentSpanContext?.spanId).toBe(
+        coordinator.spanContext().spanId
+      )
+      expect(leaf.parentSpanContext?.spanId).toBe(parent.spanContext().spanId)
+    }
+  )
 
   it('bounds event-count replay, warns once, and never drops local diagnostics', async () => {
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
@@ -755,7 +788,7 @@ describe('tooling OTel replay', () => {
     expect(exported).toHaveLength(0)
   })
 
-  it('defers coarse replay SDK work and progresses before root completion', async () => {
+  it('reports coarse starts, ends and worker batches inline before root completion', async () => {
     const starts = jest.fn()
     const ends = jest.fn()
     const samples = jest.fn(() => ({
@@ -773,32 +806,31 @@ describe('tooling OTel replay', () => {
       ],
     })
     api.trace.setGlobalTracerProvider(provider)
-    const getTracer = jest.spyOn(api.trace, 'getTracer')
     const root = span(1)
     backend.configureState(1, false)
     backend.enableReporting()
+    expect(starts).toHaveBeenCalledTimes(1)
+    expect(ends).not.toHaveBeenCalled()
     const child = nextTracer.startSpan(types.ToolingSpan.runWebpackCompiler, {
       spanName: 'child',
       parent: root,
       attributes: { initial: true },
     })
+    expect(starts).toHaveBeenCalledTimes(2)
     child.setAttribute('final', 'value')
     child.end()
+    expect(ends).toHaveBeenCalledTimes(1)
     backend.replayWorkerEvents(
       [{ id: 20, parentId: 1, name: 'worker', timestamp: 10, duration: 5 }],
       [{ id: 20, parentId: 1 }]
     )
-    expect(getTracer).not.toHaveBeenCalled()
-    expect(starts).not.toHaveBeenCalled()
-    expect(ends).not.toHaveBeenCalled()
-    expect(samples).not.toHaveBeenCalled()
-    await retry(() => expect(ends).toHaveBeenCalledTimes(2))
+    expect(samples).toHaveBeenCalledTimes(3)
     expect(starts).toHaveBeenCalledTimes(3)
     expect(ends).toHaveBeenCalledTimes(2)
     // The real unfinished root is open, not artificially ended to make progress.
     expect(local.map((event) => event.name)).toEqual(['child'])
     root.end()
-    expect(ends).toHaveBeenCalledTimes(2)
+    expect(ends).toHaveBeenCalledTimes(3)
     await backend.flushReporting()
     expect(ends).toHaveBeenCalledTimes(3)
   })
@@ -869,7 +901,7 @@ describe('tooling OTel replay', () => {
     state.setAttribute('payload', '🌏'.repeat(reporting.REPLAY_BYTE_LIMIT / 4))
     state.setAttribute('failed', true)
     state.end(tracing.toolingSpanTime(start + BigInt(777)))
-    expect(exported).toHaveLength(0)
+    expect(exported).toHaveLength(1)
     await backend.flushReporting()
     expect(exported).toHaveLength(1)
     expect(exported[0].duration).toEqual([0, 777])
@@ -892,7 +924,7 @@ describe('tooling OTel replay', () => {
       payload: cyclic,
       failed: true,
     })
-    expect(exported).toHaveLength(0)
+    expect(exported).toHaveLength(1)
     await backend.flushReporting()
     expect(exported).toHaveLength(1)
     expect(exported[0].duration).toEqual([0, 777])
@@ -1128,7 +1160,154 @@ describe('tooling OTel replay', () => {
     expect(exported).toHaveLength(1)
   })
 
-  it('has one yielding drain owner, prioritizes terminals and never spins on live spans', async () => {
+  it('handles SDK callbacks that complete their own start and capture descendants without recursive SDK entry', () => {
+    const start = BigInt(1_700_000_000_000_000_000)
+    const root = reporting.startReporting(
+      1,
+      undefined,
+      'root',
+      start,
+      undefined,
+      true
+    )!
+    let inside = false
+    let recursive = false
+    const starts = jest.fn(() => {
+      recursive ||= inside
+      inside = true
+      if (starts.mock.calls.length === 1) {
+        reporting.endReporting(root, start + BigInt(2000), { final: true })
+        const child = reporting.startReporting(2, 1, 'child', start, root)
+        reporting.endReporting(child, start + BigInt(1000), {})
+      }
+      inside = false
+    })
+    api.trace.setGlobalTracerProvider(
+      new sdk.TracerProvider({
+        spanProcessors: [
+          {
+            onStart: starts,
+            onEnd: (entry) => exported.push(entry),
+            async forceFlush() {},
+            async shutdown() {},
+          },
+        ],
+      })
+    )
+    backend.enableReporting()
+    expect(recursive).toBe(false)
+    expect(starts).toHaveBeenCalledTimes(2)
+    expect(exported.map((entry) => entry.name)).toEqual(['root', 'child'])
+    expect(exported[0].attributes.final).toBe(true)
+    expect(exported[0].duration).toEqual([0, 2000])
+    expect(exported[1].parentSpanContext?.spanId).toBe(
+      exported[0].spanContext().spanId
+    )
+  })
+
+  it.each(
+    (['start', 'attributes', 'status', 'end'] as const).flatMap((phase) =>
+      (['reset', 'close'] as const).map((action) => ({ phase, action }))
+    )
+  )(
+    'isolates reentrant $action during SDK $phase callbacks',
+    async ({ phase, action }) => {
+      const start = BigInt(1_700_000_000_000_000_000)
+      let first = true
+      let pending: Promise<void> | undefined
+      const act = () => {
+        if (!first) return
+        first = false
+        if (action === 'close') pending = backend.flushReporting()
+        else {
+          const replacement = reporting.startReporting(
+            2,
+            undefined,
+            'replacement',
+            start,
+            undefined,
+            true
+          )
+          reporting.endReporting(replacement, start + BigInt(1000), {})
+          backend.enableReporting()
+        }
+      }
+      api.trace.disable()
+      api.trace.setGlobalTracerProvider(
+        new sdk.TracerProvider({
+          spanProcessors: [
+            {
+              onStart(entry) {
+                if (phase === 'start') act()
+                else if (phase !== 'end') {
+                  const method =
+                    phase === 'attributes' ? 'setAttributes' : 'setStatus'
+                  const original = entry[method].bind(entry)
+                  jest.spyOn(entry, method).mockImplementation((value: any) => {
+                    act()
+                    return original(value)
+                  })
+                }
+              },
+              onEnd(entry) {
+                exported.push(entry)
+                if (phase === 'end') act()
+              },
+              async forceFlush() {},
+              async shutdown() {},
+            },
+          ],
+        })
+      )
+      const before = exported.length
+      const old = reporting.startReporting(
+        1,
+        undefined,
+        'old',
+        start,
+        undefined,
+        true
+      )
+      backend.enableReporting()
+      reporting.endReporting(old, start + BigInt(2000), { failed: true })
+      await pending
+      await backend.flushReporting()
+      expect(exported.slice(before).map((entry) => entry.name)).toEqual([
+        ...(phase === 'end' ? ['old'] : []),
+        ...(action === 'reset' ? ['replacement'] : []),
+      ])
+      expect(old).toMatchObject({ retained: false, name: '', size: 0 })
+      expect(old!.span).toBeUndefined()
+    }
+  )
+
+  it('keeps local diagnostics and warns once when application SDK starts throw', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
+    api.trace.setGlobalTracerProvider(
+      new sdk.TracerProvider({
+        spanProcessors: [
+          {
+            onStart() {
+              throw new Error('application processor failure')
+            },
+            onEnd: (entry) => exported.push(entry),
+            async forceFlush() {},
+            async shutdown() {},
+          },
+        ],
+      })
+    )
+    const root = span(1)
+    backend.enableReporting()
+    expect(() => span(2, 1, root).end()).not.toThrow()
+    expect(() => root.end()).not.toThrow()
+    await backend.flushReporting()
+    expect(local).toHaveLength(2)
+    expect(exported).toHaveLength(0)
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports without scheduled callbacks and never invents ends for live spans', async () => {
     jest.useFakeTimers()
     installApplicationProvider()
     const root = span(1)
@@ -1143,10 +1322,8 @@ describe('tooling OTel replay', () => {
     terminal.end()
     backend.enableReporting()
     backend.enableReporting()
-    expect(jest.getTimerCount()).toBe(1)
-    await jest.runOnlyPendingTimersAsync()
+    expect(jest.getTimerCount()).toBe(0)
     expect(exported.map((entry) => entry.name)).toEqual(['terminal'])
-    expect(jest.getTimerCount()).toBe(1)
     await jest.runAllTimersAsync()
     expect(jest.getTimerCount()).toBe(0)
     expect(exported).toHaveLength(1)
@@ -1190,25 +1367,24 @@ describe('tooling OTel replay', () => {
     expect(jest.getTimerCount()).toBe(0)
   })
 
-  it('cancels old queued work when a new root starts before a scheduled turn', async () => {
-    jest.useFakeTimers()
+  it('discards stale handles and hooks when a new root replaces a session', async () => {
     installApplicationProvider()
-    span(1).end()
+    const old = span(1)
     const oldHook = jest.fn()
     backend.enableReporting(oldHook)
     const root = nextTracer.startSpan(types.ToolingSpan.nextBuild, {
       spanName: 'replacement',
     })
+    old.end()
     root.end()
+    expect(exported).toHaveLength(0)
     backend.enableReporting()
-    const flush = backend.flushReporting()
-    await jest.runAllTimersAsync()
-    await flush
-    expect(oldHook).not.toHaveBeenCalled()
     expect(exported.map((entry) => entry.name)).toEqual(['replacement'])
+    await backend.flushReporting()
+    expect(oldHook).not.toHaveBeenCalled()
   })
 
-  it('uses separate cooperative drain and hook budgets and still calls the hook after drain loss', async () => {
+  it('runs slow SDK callbacks inline without a drain deadline and times out only the hook', async () => {
     jest.useFakeTimers()
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
     const starts = jest.fn(() => {
@@ -1235,13 +1411,13 @@ describe('tooling OTel replay', () => {
     const hook = jest.fn(() => new Promise<void>(() => {}))
     backend.enableReporting(hook)
     const flush = backend.flushReporting()
-    await jest.runOnlyPendingTimersAsync()
-    expect(starts).toHaveBeenCalledTimes(1)
-    expect(exported).toHaveLength(0)
+    expect(starts).toHaveBeenCalledTimes(2)
+    expect(exported.map((entry) => entry.name)).toEqual(['waiting'])
+    await Promise.resolve()
     expect(hook).toHaveBeenCalledTimes(1)
     await jest.advanceTimersByTimeAsync(reporting.FLUSH_TIMEOUT_MS)
     await flush
-    expect(warn).toHaveBeenCalledTimes(2)
+    expect(warn).toHaveBeenCalledTimes(1)
     expect(jest.getTimerCount()).toBe(0)
   })
 

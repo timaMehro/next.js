@@ -8,8 +8,6 @@ export const REPLAY_EVENT_LIMIT = 10_000
 export const REPLAY_BYTE_LIMIT = 8 * 1024 * 1024
 export const FLUSH_TIMEOUT_MS = 5_000
 const ROOT_BYTES = 512
-const TURN_RECORDS = 64
-const TURN_MS = 4
 
 export type ReportingRecord = {
   id: number
@@ -28,10 +26,8 @@ export type ReportingRecord = {
   generation: number
 }
 
-type State = 'unregistered' | 'ready' | 'finalizing' | 'closed'
-let state: State = 'unregistered'
-// Resolve the shared SDK backend once inside the consumer. Local-only producers
-// never import it; application API/SDK ownership is the same as the Next tracer.
+let state: 'unregistered' | 'ready' | 'closed' = 'unregistered'
+// Local-only producers never load this application-owned Next tracer backend.
 let backend: typeof import('../server/lib/trace/otel-api') | undefined
 let generation = 0
 let suppressed = false
@@ -39,17 +35,12 @@ let warned = false
 let retainedBytes = 0
 let defaultParent: ReportingRecord | undefined
 let flushHook: (() => void | Promise<void>) | undefined
-let scheduled: ReturnType<typeof setImmediate> | undefined
 let finalization: Promise<void> | undefined
-let deadline = Infinity
-let drained: (() => void) | undefined
+// SDK callbacks may capture/end spans or reset/close the session. Finish such
+// captures after the active SDK call returns, without recursively entering it.
+let reporting = false
+let reentered = false
 const records = new Map<number, ReportingRecord>()
-const openings = new Set<ReportingRecord>()
-const terminals = new Set<ReportingRecord>()
-// One iterative traversal, retained across turns. Ancestors count toward the
-// same turn budget as children; deep worker trees never recurse on the JS stack.
-const stack: ReportingRecord[] = []
-const visiting = new Set<ReportingRecord>()
 
 function warnLoss() {
   if (!warned) {
@@ -89,8 +80,6 @@ function release(record: ReportingRecord) {
     retainedBytes -= record.size
     if (records.get(record.id) === record) records.delete(record.id)
   }
-  openings.delete(record)
-  terminals.delete(record)
   record.name = ''
   record.encoded = undefined
   record.span = undefined
@@ -100,48 +89,17 @@ function release(record: ReportingRecord) {
 }
 
 function clearWork() {
-  clearImmediate(scheduled)
-  scheduled = undefined
   for (const record of records.values()) release(record)
-  stack.length = 0
-  visiting.clear()
-  drained?.()
-  drained = undefined
-}
-
-function newRoot() {
-  generation++
-  clearWork()
-  defaultParent = undefined
-  flushHook = undefined
-  finalization = undefined
-  state = 'unregistered'
-  warned = false
-  deadline = Infinity
-}
-
-function requestDrain() {
-  if (scheduled || suppressed || (state !== 'ready' && state !== 'finalizing'))
-    return
-  const current = generation
-  scheduled = setImmediate(() => {
-    scheduled = undefined
-    if (current === generation) consume()
-  })
 }
 
 function canEmit(record: ReportingRecord) {
   return (
-    record.retained &&
-    record.generation === generation &&
-    (state === 'ready' || state === 'finalizing') &&
-    performance.now() < deadline
+    record.retained && record.generation === generation && state === 'ready'
   )
 }
 
-// This is the only bridge-owned API/SDK entry point. Deferred coarse replay
-// shares the Next tracer's application-owned backend; fine local producers do
-// not reach this consumer or pay its sampling/processor costs.
+// Selected coarse SDK work runs synchronously; fine local producers never enter
+// this adapter or pay its application sampling/processor costs.
 function emit(record: ReportingRecord) {
   try {
     const {
@@ -149,8 +107,7 @@ function emit(record: ReportingRecord) {
       getTracerInstance,
     } = (backend ??=
       require('../server/lib/trace/otel-api') as typeof import('../server/lib/trace/otel-api'))
-    const tags =
-      record.end === undefined ? undefined : attributes(record.encoded)
+    const completed = record.end !== undefined
     const alreadyStarted = !!record.span
     if (!record.span) {
       const parent =
@@ -161,7 +118,9 @@ function emit(record: ReportingRecord) {
       const context = parent
         ? trace.setSpanContext(ROOT_CONTEXT, parent)
         : ROOT_CONTEXT
-      const span = getTracerInstance().startSpan(
+      const tracer = getTracerInstance()
+      if (!canEmit(record)) return
+      const span = tracer.startSpan(
         record.name,
         {
           startTime: time(record.start),
@@ -171,7 +130,7 @@ function emit(record: ReportingRecord) {
             ...(record.parentId === undefined
               ? {}
               : { 'next.tooling.parent_id': record.parentId }),
-            ...tags,
+            ...(completed ? attributes(record.encoded) : undefined),
           },
         },
         context
@@ -180,10 +139,10 @@ function emit(record: ReportingRecord) {
       record.span = span
       record.context = span.spanContext()
     }
-    openings.delete(record)
-    if (record.end !== undefined) {
-      if (!canEmit(record)) return
-      if (alreadyStarted && tags) record.span.setAttributes(tags)
+    if (record.end !== undefined && canEmit(record)) {
+      // Completion can itself happen reentrantly during startSpan/onStart.
+      if (alreadyStarted || !completed)
+        record.span.setAttributes(attributes(record.encoded))
       if (!canEmit(record)) return
       if (record.failed) record.span.setStatus({ code: SpanStatusCode.ERROR })
       if (!canEmit(record)) return
@@ -191,75 +150,71 @@ function emit(record: ReportingRecord) {
       release(record)
     }
   } catch {
-    warnLoss()
+    if (record.generation === generation) warnLoss()
     release(record)
   }
 }
 
-function consume() {
-  const started = performance.now()
-  let processed = 0
-  while (state === 'ready' || state === 'finalizing') {
-    if (performance.now() >= deadline) {
-      warnLoss()
-      clearWork()
-      return
-    }
-    if (processed >= TURN_RECORDS || performance.now() - started >= TURN_MS)
-      break
-    if (!stack.length) {
-      const next =
-        terminals.values().next().value ?? openings.values().next().value
-      if (!next) break
-      stack.push(next)
-      visiting.add(next)
-    }
-    const record = stack[stack.length - 1]
-    if (!record.retained || record.generation !== generation) {
-      stack.pop()
-      visiting.delete(record)
-      continue
-    }
-    let parent = record.parent
-    if (
-      parent &&
-      (parent.generation !== generation ||
-        (!parent.retained && !parent.context))
-    ) {
-      parent = record.parent =
-        record === defaultParent ? undefined : defaultParent
-    }
-    if (parent?.retained && !parent.context) {
-      if (!visiting.has(parent)) {
-        stack.push(parent)
-        visiting.add(parent)
-        // Traversal itself is bounded too, even before the first SDK call.
-        processed++
-        continue
-      }
-      warnLoss()
-      record.parent = record === defaultParent ? undefined : defaultParent
-      if (
-        record.parent &&
-        !visiting.has(record.parent) &&
-        !record.parent.context
-      )
-        continue
-      record.parent = undefined
-    }
-    stack.pop()
-    visiting.delete(record)
-    emit(record)
-    processed++
+function report(input: Iterable<ReportingRecord>) {
+  if (state !== 'ready' || suppressed) return
+  if (reporting) {
+    reentered = true
+    return
   }
-  if (stack.length || terminals.size || openings.size) requestDrain()
-  else {
-    drained?.()
-    drained = undefined
+  reporting = true
+  try {
+    do {
+      reentered = false
+      // Synchronous iterative ancestry resolution also handles deep, completion-
+      // ordered worker batches. No traversal or SDK-creation work survives a turn.
+      const stack: ReportingRecord[] = []
+      const visiting = new Set<ReportingRecord>()
+      for (const next of input) {
+        stack.push(next)
+        visiting.add(next)
+        while (stack.length) {
+          const record = stack[stack.length - 1]
+          if (canEmit(record) && (!record.span || record.end !== undefined)) {
+            let parent = record.parent
+            if (
+              parent &&
+              (parent.generation !== generation ||
+                (!parent.retained && !parent.context))
+            ) {
+              parent = record.parent =
+                record === defaultParent ? undefined : defaultParent
+            }
+            if (parent?.retained && !parent.context) {
+              if (!visiting.has(parent)) {
+                stack.push(parent)
+                visiting.add(parent)
+                continue
+              }
+              warnLoss()
+              record.parent =
+                record === defaultParent ? undefined : defaultParent
+              if (
+                record.parent &&
+                !visiting.has(record.parent) &&
+                !record.parent.context
+              )
+                continue
+              record.parent = undefined
+            }
+            emit(record)
+          }
+          stack.pop()
+          visiting.delete(record)
+        }
+      }
+      input = records.values()
+    } while (reentered)
+  } finally {
+    reporting = false
   }
 }
 
-export function startReporting(
+function retain(
   id: number,
   parentId: number | undefined,
   name: string,
@@ -269,7 +224,15 @@ export function startReporting(
 ): ReportingRecord | undefined {
   // A root marker cannot turn a compiler worker into an SDK coordinator.
   if (suppressed) return undefined
-  if (root && (defaultParent || state === 'closed')) newRoot()
+  if (root && (defaultParent || state === 'closed')) {
+    generation++
+    clearWork()
+    defaultParent = undefined
+    flushHook = undefined
+    finalization = undefined
+    state = 'unregistered'
+    warned = false
+  }
   if (state === 'closed') return undefined
   const size = 256 + 2 * name.length
   const reserve = defaultParent?.retained || root ? 0 : 1
@@ -297,10 +260,40 @@ export function startReporting(
   }
   retainedBytes += size
   records.set(id, record)
-  openings.add(record)
   if (root) defaultParent = record
-  requestDrain()
   return record
+}
+
+export function startReporting(
+  ...args: Parameters<typeof retain>
+): ReportingRecord | undefined {
+  const record = retain(...args)
+  if (record) report([record])
+  return record
+}
+
+function complete(
+  record: ReportingRecord,
+  end: bigint,
+  tags: Record<string, unknown>
+) {
+  // Terminal metadata survives payload overflow/encoding failure.
+  record.end = end
+  record.failed = tags.failed === true
+  try {
+    const encoded = JSON.stringify(tags)
+    if (!record.retained || record.generation !== generation) return
+    const bytes = 2 * encoded.length
+    const reserve = defaultParent?.retained ? 0 : ROOT_BYTES
+    if (retainedBytes + bytes + reserve > REPLAY_BYTE_LIMIT) warnLoss()
+    else {
+      record.encoded = encoded
+      record.size += bytes
+      retainedBytes += bytes
+    }
+  } catch {
+    if (record.generation === generation) warnLoss()
+  }
 }
 
 export function endReporting(
@@ -314,25 +307,8 @@ export function endReporting(
     record.end !== undefined
   )
     return
-  // Terminal metadata must survive payload overflow/encoding failure. There is
-  // no separate end queue allocation that can lose an admitted operation's end.
-  record.end = end
-  record.failed = tags.failed === true
-  terminals.add(record)
-  try {
-    const encoded = JSON.stringify(tags)
-    const bytes = 2 * encoded.length
-    const reserve = defaultParent?.retained ? 0 : ROOT_BYTES
-    if (retainedBytes + bytes + reserve > REPLAY_BYTE_LIMIT) warnLoss()
-    else {
-      record.encoded = encoded
-      record.size += bytes
-      retainedBytes += bytes
-    }
-  } catch {
-    warnLoss()
-  }
-  requestDrain()
+  complete(record, end, tags)
+  report([record])
 }
 
 export function configureReporting(
@@ -359,67 +335,50 @@ export function replayCompleted(
   const parents = new Map<number, number | undefined>()
   for (const event of events) {
     const { start, end } = timing(event)
-    const record = startReporting(event.id, event.parentId, event.name, start)
+    const record = retain(event.id, event.parentId, event.name, start)
     if (record) {
-      endReporting(record, end, event.tags ?? {})
+      complete(record, end, event.tags ?? {})
       batch.set(event.id, record)
       parents.set(event.id, parentId(event))
     }
   }
-  // Completion order is not topology order. Resolve the entire admitted batch
-  // before any deferred SDK work. A dropped parent falls back to the real root.
+  // Completion order is not topology order. Stage the entire admitted batch
+  // before inline reporting; a dropped parent falls back to the real root.
   for (const record of batch.values()) {
     record.parent =
       batch.get(parents.get(record.id)!) ??
       records.get(parents.get(record.id)!) ??
       defaultParent
-    if (!record.parent) {
-      warnLoss()
-      release(record)
-    }
   }
+  report(batch.values())
 }
 
 export function enableReporting(hook?: () => void | Promise<void>) {
   if (state !== 'unregistered' || suppressed) return
   state = 'ready'
   flushHook = hook
-  requestDrain()
+  report(records.values())
 }
 
 export function flushReporting(): Promise<void> {
   if (finalization) return finalization
   if (state === 'closed') return Promise.resolve()
   const current = generation
-  const hook = flushHook
-  const registered = state === 'ready'
-  state = 'finalizing'
-  clearImmediate(scheduled)
-  scheduled = undefined
-  deadline = performance.now() + FLUSH_TIMEOUT_MS
+  const hook = state === 'ready' ? flushHook : undefined
+  state = 'closed'
+  clearWork()
+  defaultParent = undefined
+  flushHook = undefined
+  // No private SDK-creation queue remains. Close intake before the optional app
+  // hook; never manufacture completion for a genuinely unfinished operation.
   finalization = (async () => {
-    if (
-      registered &&
-      !suppressed &&
-      (openings.size || terminals.size || stack.length)
-    ) {
-      await new Promise<void>((resolve) => {
-        drained = resolve
-        requestDrain()
-      })
-    }
-    if (current !== generation) return
-    state = 'closed'
-    clearWork()
-    defaultParent = undefined
-    flushHook = undefined
-    if (!registered || !hook) return
-    // The app owns this hook; run it only after the consumer is quiescent and
-    // closed, with its own allowance independent of the final drain deadline.
+    if (!hook) return
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
       await Promise.race([
-        Promise.resolve().then(hook),
+        Promise.resolve().then(() => {
+          if (current === generation) return hook()
+        }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(
             () => reject(new Error('timeout')),
