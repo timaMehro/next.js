@@ -101,7 +101,7 @@ export type ToolingSpanSource = {
   startTime: bigint
   wallStartTimeMs: number
   reporting?: ReportingRecord
-  // Nearest selected coarse ancestor; fine spans never create a descriptor.
+  // Nearest selected ancestor; unselected fine spans create no descriptor.
   reportingParent?: ReportingRecord
   reportingParentId?: SpanId
 }
@@ -210,7 +210,19 @@ export function completeToolingSpan(
       if (shouldSaveTraceEvents) savedTraceEvents.push(event)
     }
   } finally {
-    if (source.reporting) otel?.stopSpan(source.reporting, end, attributes)
+    if (source.reporting) {
+      otel?.stopSpan(source.reporting, end, attributes)
+    } else if (name === 'client-hmr-latency') {
+      // One selected completed browser observation, not promotion of all fine
+      // local spans. Local delivery above keeps its original fields and timing.
+      otel?.replayCompletedSpan(
+        event,
+        source.startTime,
+        end,
+        source.reportingParent,
+        source.reportingParentId ?? source.parentId
+      )
+    }
   }
 }
 

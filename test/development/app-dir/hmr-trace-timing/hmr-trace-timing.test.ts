@@ -1,6 +1,7 @@
 import { nextTestSetup } from 'e2e-utils'
 import { join } from 'path'
 import { existsSync } from 'fs'
+import { retry } from 'next-test-utils'
 import {
   expectTraceEventContract,
   parseTraceFile,
@@ -24,9 +25,25 @@ describe('render-path tracing', () => {
     const requestStartedAt = Date.now()
     expect((await next.render$('/'))('p').text()).toBe('hello world')
 
+    const browser = await next.browser('/')
+    await browser.eval(`
+      window.__toolingHmrDocument = true
+      window.__NEXT_HMR_LATENCY_CB = (latency) => {
+        window.__toolingHmrLatency = latency
+      }
+    `)
     await next.patchFile('app/page.tsx', (content) =>
       content.replace('hello world', 'hello after edit')
     )
+    await retry(async () => {
+      expect(await browser.elementByCss('p').text()).toBe('hello after edit')
+      expect(await browser.eval('window.__toolingHmrDocument')).toBe(true)
+      expect(await browser.eval('window.__toolingHmrLatency')).toEqual(
+        expect.any(Number)
+      )
+    })
+    const clientLatency = await browser.eval('window.__toolingHmrLatency')
+    await browser.close()
     expect((await next.render$('/'))('p').text()).toBe('hello after edit')
     expect((await next.render$('/slow'))('p').text()).toBe('slow page')
     const requestFinishedAt = Date.now()
@@ -44,6 +61,27 @@ describe('render-path tracing', () => {
     expect(startup).toHaveLength(1)
     expect(startup[0].parentId).toBeUndefined()
     expect(eventsByName.get('compile-path')?.length).toBeGreaterThan(0)
+
+    const clientEvents = eventsByName.get('client-hmr-latency') ?? []
+    expect(clientEvents.length).toBeGreaterThan(0)
+    const clientEvent = clientEvents.find((event) => event.tags.page === '/')!
+    expect(clientEvent).toBeDefined()
+    expect(clientEvent.duration).toBe(clientLatency * 1000)
+    expect(clientEvent.startTime).toBeGreaterThanOrEqual(requestStartedAt - 10)
+    expect(clientEvent.startTime).toBeLessThanOrEqual(requestFinishedAt)
+    expect(clientEvent.tags).toMatchObject({
+      page: '/',
+      isPageHidden: expect.any(Boolean),
+    })
+    expect(Object.keys(clientEvent.tags).sort()).toEqual([
+      'isPageHidden',
+      'page',
+      'updatedModules',
+    ])
+    expect(
+      events.find((event) => event.id === clientEvent.parentId)?.name
+    ).toBe('hot-reloader')
+    expect(clientEvent.traceId).toBe(startup[0].traceId)
 
     const slowRender = eventsByName
       .get('render-path')

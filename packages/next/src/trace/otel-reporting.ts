@@ -103,7 +103,7 @@ function canEmit(record: ReportingRecord) {
   )
 }
 
-// Selected coarse SDK work runs synchronously; fine local producers never enter
+// Selected SDK work runs synchronously; unselected local producers never enter
 // this adapter or pay its application sampling/processor costs.
 function emit(record: ReportingRecord) {
   try {
@@ -332,7 +332,8 @@ export function replayCompleted(
   events: TraceEvent[],
   timing: (event: TraceEvent) => { start: bigint; end: bigint },
   parentId: (event: TraceEvent) => number | undefined = (event) =>
-    event.parentId
+    event.parentId,
+  parent?: ReportingRecord
 ) {
   if (suppressed || state === 'closed') return
   if (!defaultParent) {
@@ -354,6 +355,7 @@ export function replayCompleted(
   // before inline reporting; a dropped parent falls back to the real root.
   for (const record of batch.values()) {
     record.parent =
+      parent ??
       batch.get(parents.get(record.id)!) ??
       coordinatorRecords.get(parents.get(record.id)!) ??
       defaultParent

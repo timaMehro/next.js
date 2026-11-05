@@ -44,6 +44,23 @@ export function stopSpan(
   endReporting(record, epochTime(stopTime), tags)
 }
 
+// Browser latency arrives already complete. Keep its lossless source clocks and
+// direct selected-parent token, including after that parent's local completion.
+export function replayCompletedSpan(
+  event: TraceEvent,
+  start: bigint,
+  end: bigint,
+  parent: ReportingRecord | undefined,
+  parentId: number | undefined
+) {
+  replayCompleted(
+    [event],
+    () => ({ start: epochTime(start), end: epochTime(end) }),
+    () => parentId,
+    parent
+  )
+}
+
 export function getClockOffset() {
   return epochOffset.toString()
 }

@@ -2,6 +2,7 @@ import { createServer, type Server } from 'node:http'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { isNextDev, nextTestSetup } from 'e2e-utils'
+import { retry } from 'next-test-utils'
 import {
   expectTraceEventContract,
   parseTraceFile,
@@ -34,7 +35,8 @@ type Message = {
     toolingId: unknown
   }[]
 }
-const coarseNames = new Set([
+const selectedNames = new Set([
+  'client-hmr-latency',
   'next-build',
   'run-webpack',
   'run-webpack-compiler',
@@ -75,10 +77,20 @@ const dependencies = {
   '@opentelemetry/sdk-trace': '2.12.0',
 }
 
+const providerCases = (
+  isNextDev ? ['.next', 'otel-output'] : ['otel-output']
+).flatMap((distDir) =>
+  ['on', 'off'].map((sampler) => ({
+    name: `${sampler} sampler, ${distDir} output`,
+    sampler,
+    distDir,
+  }))
+)
+
 // Local files, local collector, and CLI process shutdown are self-hosted contracts.
 // @force-gate !deploy
 describe('experimental tooling OTel', () => {
-  describe.each(['on', 'off'])('application sampler %s', (sampler) => {
+  describe.each(providerCases)('$name', ({ sampler, distDir }) => {
     const { next } = nextTestSetup({
       files: __dirname,
       skipStart: true,
@@ -97,9 +109,15 @@ describe('experimental tooling OTel', () => {
       collector = await startCollector(messages)
       const address = collector.address() as { port: number }
       next.env.TOOLING_ENDPOINT = `http://127.0.0.1:${address.port}`
+      if (isNextDev && distDir === '.next') {
+        // Keep the default legacy path and the existing custom-dev path covered.
+        await next.patchFile('next.config.ts', (source) =>
+          source.replace("'otel-output'", "'.next'")
+        )
+      }
       next.env.TOOLING_TRACE_FILE = join(
-        'otel-output',
-        isNextDev ? 'dev' : '',
+        distDir,
+        ...(isNextDev ? ['dev'] : []),
         'trace'
       )
       await next.start()
@@ -112,21 +130,64 @@ describe('experimental tooling OTel', () => {
 
     it('keeps local diagnostics independent while exporting through the application provider', async () => {
       expect(await next.render('/')).toContain('hello world')
+      let clientLatency: number | undefined
+      const editStartedAt = Date.now()
       if (isNextDev) {
+        const browser = await next.browser('/')
+        await browser.eval(`
+          window.__toolingHmrDocument = true
+          window.__NEXT_HMR_LATENCY_CB = (latency) => {
+            window.__toolingHmrLatency = latency
+          }
+        `)
         await next.patchFile('app/page.tsx', (source) =>
           source.replace('hello world', 'edited page')
         )
-        expect(await next.render('/')).toContain('edited page')
+        await retry(async () => {
+          expect(await browser.elementByCss('p').text()).toBe('edited page')
+          expect(await browser.eval('window.__toolingHmrDocument')).toBe(true)
+          expect(await browser.eval('window.__toolingHmrLatency')).toEqual(
+            expect.any(Number)
+          )
+        })
+        clientLatency = await browser.eval('window.__toolingHmrLatency')
+        await browser.close()
       }
+      const editFinishedAt = Date.now()
       await next.stop('SIGTERM')
       const local = parseTraceFile(
         join(next.testDir, next.env.TOOLING_TRACE_FILE)
       ).events
       expectTraceEventContract(local)
+      const clientEvent = local.find(
+        (event) =>
+          event.name === 'client-hmr-latency' && event.tags.page === '/'
+      )
+      if (isNextDev) {
+        expect(clientEvent).toBeDefined()
+        expect(clientEvent!.startTime).toBeGreaterThanOrEqual(
+          editStartedAt - 10
+        )
+        expect(clientEvent!.startTime).toBeLessThanOrEqual(editFinishedAt)
+        expect(clientEvent!.duration).toBe(clientLatency! * 1000)
+        expect(clientEvent!.tags).toMatchObject({
+          page: '/',
+          isPageHidden: expect.any(Boolean),
+        })
+        expect(Object.keys(clientEvent!.tags).sort()).toEqual([
+          'isPageHidden',
+          'page',
+          'updatedModules',
+        ])
+        expect(clientEvent!.tags.updatedModules).toBeDefined()
+        const parent = local.find((event) => event.id === clientEvent!.parentId)
+        expect(parent?.name).toBe('hot-reloader')
+        expect(clientEvent!.traceId).toBe(parent!.traceId)
+      }
       const rootName = isNextDev ? 'start-dev-server' : 'next-build'
       expect(local.some((event) => event.name === rootName)).toBe(true)
       // Fine observations remain in the full local hierarchy, never the SDK lane.
-      expect(local.some((event) => !coarseNames.has(event.name))).toBe(true)
+      expect(local.some((event) => !selectedNames.has(event.name))).toBe(true)
       const flushes = messages.filter((message) => message.kind === 'flush')
       const registrations = messages.filter(
         (message) => message.kind === 'register'
@@ -166,6 +227,19 @@ describe('experimental tooling OTel', () => {
       if (sampler === 'off') {
         expect(tooling).toHaveLength(0)
         return
+      }
+      if (isNextDev) {
+        const exportedClient = tooling.find(
+          (span) => span.attributes['next.tooling.id'] === clientEvent!.id
+        )
+        expect(exportedClient?.name).toBe('client-hmr-latency')
+        for (const [key, value] of Object.entries(clientEvent!.tags)) {
+          // The existing SDK adapter JSON-encodes arrays/objects; local tags
+          // retain supported arrays. Do not change either encoding for HMR.
+          expect(exportedClient!.attributes[key]).toEqual(
+            typeof value === 'object' ? JSON.stringify(value) : value
+          )
+        }
       }
       expect(tooling.map((span) => span.name)).toContain(rootName)
       const root = tooling.find((span) => span.name === rootName)!
@@ -228,7 +302,7 @@ describe('experimental tooling OTel', () => {
       for (const span of tooling) {
         expect(span.traceId).toBe(root.traceId)
         expect(span.instrumentationScope).toBe('next.js')
-        expect(coarseNames.has(span.name)).toBe(true)
+        expect(selectedNames.has(span.name)).toBe(true)
         const event = localById.get(
           span.attributes['next.tooling.id'] as number
         )!
@@ -253,7 +327,7 @@ describe('experimental tooling OTel', () => {
           while (parentId !== undefined && !seen.has(parentId)) {
             seen.add(parentId)
             const localParent = localById.get(parentId)
-            if (!localParent || coarseNames.has(localParent.name)) break
+            if (!localParent || selectedNames.has(localParent.name)) break
             parentId = localParent.parentId
           }
           expect(parent.attributes['next.tooling.id']).toBe(parentId)
