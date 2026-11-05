@@ -178,130 +178,131 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {
   async createTraceAssets(compilation: webpack.Compilation, span: Span) {
     const outputPath = compilation.outputOptions.path || ''
 
+    const emitTraceAssets = async () => {
+      const entryFilesMap = new Map<any, Set<string>>()
+      const chunksToTrace = new Set<string>()
+      const entryNameFilesMap = new Map<string, Array<string>>()
+
+      const isTraceable = (file: string) =>
+        !NOT_TRACEABLE.some((suffix) => {
+          return file.endsWith(suffix)
+        })
+
+      for (const entrypoint of compilation.entrypoints.values()) {
+        const entryFiles = new Set<string>()
+
+        for (const chunk of entrypoint
+          .getEntrypointChunk()
+          .getAllReferencedChunks()) {
+          for (const file of chunk.files) {
+            if (isTraceable(file)) {
+              const filePath = nodePath.join(outputPath, file)
+              chunksToTrace.add(filePath)
+              entryFiles.add(filePath)
+            }
+          }
+          for (const file of chunk.auxiliaryFiles) {
+            if (isTraceable(file)) {
+              const filePath = nodePath.join(outputPath, file)
+              chunksToTrace.add(filePath)
+              entryFiles.add(filePath)
+            }
+          }
+        }
+        entryFilesMap.set(entrypoint, entryFiles)
+        entryNameFilesMap.set(entrypoint.name || '', [...entryFiles])
+      }
+
+      // startTrace existed and callable
+      this.buildTraceContext.chunksTrace = {
+        action: {
+          action: 'annotate',
+          input: [...chunksToTrace],
+          contextDirectory: this.tracingRoot,
+          processCwd: this.rootDir,
+        },
+        outputPath,
+        entryNameFilesMap: Object.fromEntries(entryNameFilesMap),
+      }
+
+      // server compiler outputs to `server/chunks` so we traverse up
+      // one, but edge-server does not so don't for that one
+      const outputPrefix = this.compilerType === 'server' ? '../' : ''
+
+      for (const [entrypoint, entryFiles] of entryFilesMap) {
+        const traceOutputName = `${outputPrefix}${entrypoint.name}.js.nft.json`
+        const traceOutputPath = nodePath.dirname(
+          nodePath.join(outputPath, traceOutputName)
+        )
+
+        // don't include the entry itself in the trace
+        entryFiles.delete(
+          nodePath.join(outputPath, `${outputPrefix}${entrypoint.name}.js`)
+        )
+
+        if (entrypoint.name.startsWith('app/') && this.appDir) {
+          const appDirRelativeEntryPath =
+            this.buildTraceContext.entriesTrace?.absolutePathByEntryName[
+              entrypoint.name
+            ]?.replace(this.appDir, '')
+
+          const entryIsStaticMetadataRoute =
+            appDirRelativeEntryPath &&
+            isMetadataRouteFile(appDirRelativeEntryPath, [], true)
+
+          // Include the client reference manifest in the trace, but not for
+          // static metadata routes, for which we don't generate those.
+          if (!entryIsStaticMetadataRoute) {
+            entryFiles.add(
+              nodePath.join(
+                outputPath,
+                outputPrefix,
+                entrypoint.name.replace(/%5F/g, '_') +
+                  '_' +
+                  CLIENT_REFERENCE_MANIFEST +
+                  '.js'
+              )
+            )
+          }
+        }
+
+        const finalFiles: string[] = []
+
+        await Promise.all(
+          [
+            ...new Set([
+              ...entryFiles,
+              ...(this.entryTraces.get(entrypoint.name)?.keys() || []),
+            ]),
+          ].map(async (file) => {
+            const fileInfo = this.entryTraces.get(entrypoint.name)?.get(file)
+
+            const relativeFile = nodePath
+              .relative(traceOutputPath, file)
+              .replace(/\\/g, '/')
+
+            if (file) {
+              if (!fileInfo?.bundled) {
+                finalFiles.push(relativeFile)
+              }
+            }
+          })
+        )
+
+        compilation.emitAsset(
+          traceOutputName,
+          new sources.RawSource(
+            JSON.stringify({
+              version: TRACE_OUTPUT_VERSION,
+              files: finalFiles,
+            })
+          ) as unknown as webpack.sources.RawSource
+        )
+      }
+    }
     await traceLocalSpan(
       { name: 'create-trace-assets', parent: span },
-      async () => {
-        const entryFilesMap = new Map<any, Set<string>>()
-        const chunksToTrace = new Set<string>()
-        const entryNameFilesMap = new Map<string, Array<string>>()
-
-        const isTraceable = (file: string) =>
-          !NOT_TRACEABLE.some((suffix) => {
-            return file.endsWith(suffix)
-          })
-
-        for (const entrypoint of compilation.entrypoints.values()) {
-          const entryFiles = new Set<string>()
-
-          for (const chunk of entrypoint
-            .getEntrypointChunk()
-            .getAllReferencedChunks()) {
-            for (const file of chunk.files) {
-              if (isTraceable(file)) {
-                const filePath = nodePath.join(outputPath, file)
-                chunksToTrace.add(filePath)
-                entryFiles.add(filePath)
-              }
-            }
-            for (const file of chunk.auxiliaryFiles) {
-              if (isTraceable(file)) {
-                const filePath = nodePath.join(outputPath, file)
-                chunksToTrace.add(filePath)
-                entryFiles.add(filePath)
-              }
-            }
-          }
-          entryFilesMap.set(entrypoint, entryFiles)
-          entryNameFilesMap.set(entrypoint.name || '', [...entryFiles])
-        }
-
-        // startTrace existed and callable
-        this.buildTraceContext.chunksTrace = {
-          action: {
-            action: 'annotate',
-            input: [...chunksToTrace],
-            contextDirectory: this.tracingRoot,
-            processCwd: this.rootDir,
-          },
-          outputPath,
-          entryNameFilesMap: Object.fromEntries(entryNameFilesMap),
-        }
-
-        // server compiler outputs to `server/chunks` so we traverse up
-        // one, but edge-server does not so don't for that one
-        const outputPrefix = this.compilerType === 'server' ? '../' : ''
-
-        for (const [entrypoint, entryFiles] of entryFilesMap) {
-          const traceOutputName = `${outputPrefix}${entrypoint.name}.js.nft.json`
-          const traceOutputPath = nodePath.dirname(
-            nodePath.join(outputPath, traceOutputName)
-          )
-
-          // don't include the entry itself in the trace
-          entryFiles.delete(
-            nodePath.join(outputPath, `${outputPrefix}${entrypoint.name}.js`)
-          )
-
-          if (entrypoint.name.startsWith('app/') && this.appDir) {
-            const appDirRelativeEntryPath =
-              this.buildTraceContext.entriesTrace?.absolutePathByEntryName[
-                entrypoint.name
-              ]?.replace(this.appDir, '')
-
-            const entryIsStaticMetadataRoute =
-              appDirRelativeEntryPath &&
-              isMetadataRouteFile(appDirRelativeEntryPath, [], true)
-
-            // Include the client reference manifest in the trace, but not for
-            // static metadata routes, for which we don't generate those.
-            if (!entryIsStaticMetadataRoute) {
-              entryFiles.add(
-                nodePath.join(
-                  outputPath,
-                  outputPrefix,
-                  entrypoint.name.replace(/%5F/g, '_') +
-                    '_' +
-                    CLIENT_REFERENCE_MANIFEST +
-                    '.js'
-                )
-              )
-            }
-          }
-
-          const finalFiles: string[] = []
-
-          await Promise.all(
-            [
-              ...new Set([
-                ...entryFiles,
-                ...(this.entryTraces.get(entrypoint.name)?.keys() || []),
-              ]),
-            ].map(async (file) => {
-              const fileInfo = this.entryTraces.get(entrypoint.name)?.get(file)
-
-              const relativeFile = nodePath
-                .relative(traceOutputPath, file)
-                .replace(/\\/g, '/')
-
-              if (file) {
-                if (!fileInfo?.bundled) {
-                  finalFiles.push(relativeFile)
-                }
-              }
-            })
-          )
-
-          compilation.emitAsset(
-            traceOutputName,
-            new sources.RawSource(
-              JSON.stringify({
-                version: TRACE_OUTPUT_VERSION,
-                files: finalFiles,
-              })
-            ) as unknown as webpack.sources.RawSource
-          )
-        }
-      }
+      emitTraceAssets
     )
   }
 
@@ -653,178 +654,179 @@ export class TraceEntryPointsPlugin implements webpack.WebpackPluginInstance {
         }
       }
 
-      traceLocalSpan(
-        { span: traceEntrypointsPluginSpan, synchronous: true },
-        () => {
-          compilation.hooks.processAssets.tapAsync(
-            {
-              name: PLUGIN_NAME,
-              stage: webpack.Compilation.PROCESS_ASSETS_STAGE_SUMMARIZE,
-            },
-            (_, callback: any) => {
-              this.createTraceAssets(compilation, traceEntrypointsPluginSpan)
-                .then(() => callback())
-                .catch((err) => callback(err))
-            }
-          )
-
-          let resolver = compilation.resolverFactory.get('normal')
-
-          function getPkgName(name: string) {
-            const segments = name.split('/')
-            if (name[0] === '@' && segments.length > 1)
-              return segments.length > 1 ? segments.slice(0, 2).join('/') : null
-            return segments.length ? segments[0] : null
+      const setupTraceEntrypoints = () => {
+        compilation.hooks.processAssets.tapAsync(
+          {
+            name: PLUGIN_NAME,
+            stage: webpack.Compilation.PROCESS_ASSETS_STAGE_SUMMARIZE,
+          },
+          (_, callback: any) => {
+            this.createTraceAssets(compilation, traceEntrypointsPluginSpan)
+              .then(() => callback())
+              .catch((err) => callback(err))
           }
+        )
 
-          const getResolve = (
-            options: Parameters<typeof resolver.withOptions>[0]
-          ) => {
-            const curResolver = resolver.withOptions(options)
+        let resolver = compilation.resolverFactory.get('normal')
 
-            return (
-              parent: string,
-              request: string,
-              job: import('@vercel/nft/out/node-file-trace').Job
-            ) =>
-              new Promise<[string, boolean]>((resolve, reject) => {
-                const context = nodePath.dirname(parent)
+        function getPkgName(name: string) {
+          const segments = name.split('/')
+          if (name[0] === '@' && segments.length > 1)
+            return segments.length > 1 ? segments.slice(0, 2).join('/') : null
+          return segments.length ? segments[0] : null
+        }
 
-                curResolver.resolve(
-                  {},
-                  context,
-                  request,
-                  {
-                    fileDependencies: compilation.fileDependencies,
-                    missingDependencies: compilation.missingDependencies,
-                    contextDependencies: compilation.contextDependencies,
-                  },
-                  async (err: any, result?, resContext?) => {
-                    if (err) return reject(err)
+        const getResolve = (
+          options: Parameters<typeof resolver.withOptions>[0]
+        ) => {
+          const curResolver = resolver.withOptions(options)
 
-                    if (!result) {
-                      return reject(new Error('module not found'))
-                    }
+          return (
+            parent: string,
+            request: string,
+            job: import('@vercel/nft/out/node-file-trace').Job
+          ) =>
+            new Promise<[string, boolean]>((resolve, reject) => {
+              const context = nodePath.dirname(parent)
 
-                    // webpack resolver doesn't strip loader query info
-                    // from the result so use path instead
-                    if (result.includes('?') || result.includes('!')) {
-                      result = resContext?.path || result
-                    }
+              curResolver.resolve(
+                {},
+                context,
+                request,
+                {
+                  fileDependencies: compilation.fileDependencies,
+                  missingDependencies: compilation.missingDependencies,
+                  contextDependencies: compilation.contextDependencies,
+                },
+                async (err: any, result?, resContext?) => {
+                  if (err) return reject(err)
 
-                    try {
-                      // we need to collect all parent package.json's used
-                      // as webpack's resolve doesn't expose this and parent
-                      // package.json could be needed for resolving e.g. stylis
-                      // stylis/package.json -> stylis/dist/umd/package.json
-                      if (result.includes('node_modules')) {
-                        let requestPath = result
+                  if (!result) {
+                    return reject(new Error('module not found'))
+                  }
+
+                  // webpack resolver doesn't strip loader query info
+                  // from the result so use path instead
+                  if (result.includes('?') || result.includes('!')) {
+                    result = resContext?.path || result
+                  }
+
+                  try {
+                    // we need to collect all parent package.json's used
+                    // as webpack's resolve doesn't expose this and parent
+                    // package.json could be needed for resolving e.g. stylis
+                    // stylis/package.json -> stylis/dist/umd/package.json
+                    if (result.includes('node_modules')) {
+                      let requestPath = result
+                        .replace(/\\/g, '/')
+                        .replace(/\0/g, '')
+
+                      if (
+                        !nodePath.isAbsolute(request) &&
+                        request.includes('/') &&
+                        resContext?.descriptionFileRoot
+                      ) {
+                        requestPath = (
+                          resContext.descriptionFileRoot +
+                          request.slice(getPkgName(request)?.length || 0) +
+                          nodePath.sep +
+                          'package.json'
+                        )
                           .replace(/\\/g, '/')
                           .replace(/\0/g, '')
+                      }
 
-                        if (
-                          !nodePath.isAbsolute(request) &&
-                          request.includes('/') &&
-                          resContext?.descriptionFileRoot
-                        ) {
-                          requestPath = (
-                            resContext.descriptionFileRoot +
-                            request.slice(getPkgName(request)?.length || 0) +
-                            nodePath.sep +
-                            'package.json'
+                      const rootSeparatorIndex = requestPath.indexOf('/')
+                      let separatorIndex: number
+                      while (
+                        (separatorIndex = requestPath.lastIndexOf('/')) >
+                        rootSeparatorIndex
+                      ) {
+                        requestPath = requestPath.slice(0, separatorIndex)
+                        const curPackageJsonPath = `${requestPath}/package.json`
+                        if (await job.isFile(curPackageJsonPath)) {
+                          await job.emitFile(
+                            await job.realpath(curPackageJsonPath),
+                            'resolve',
+                            parent
                           )
-                            .replace(/\\/g, '/')
-                            .replace(/\0/g, '')
-                        }
-
-                        const rootSeparatorIndex = requestPath.indexOf('/')
-                        let separatorIndex: number
-                        while (
-                          (separatorIndex = requestPath.lastIndexOf('/')) >
-                          rootSeparatorIndex
-                        ) {
-                          requestPath = requestPath.slice(0, separatorIndex)
-                          const curPackageJsonPath = `${requestPath}/package.json`
-                          if (await job.isFile(curPackageJsonPath)) {
-                            await job.emitFile(
-                              await job.realpath(curPackageJsonPath),
-                              'resolve',
-                              parent
-                            )
-                          }
                         }
                       }
-                    } catch (_err) {
-                      // we failed to resolve the package.json boundary,
-                      // we don't block emitting the initial asset from this
                     }
-                    resolve([result, options.dependencyType === 'esm'])
+                  } catch (_err) {
+                    // we failed to resolve the package.json boundary,
+                    // we don't block emitting the initial asset from this
                   }
-                )
-              })
-          }
-
-          const CJS_RESOLVE_OPTIONS = {
-            ...NODE_RESOLVE_OPTIONS,
-            fullySpecified: undefined,
-            modules: undefined,
-            extensions: undefined,
-          }
-          const BASE_CJS_RESOLVE_OPTIONS = {
-            ...CJS_RESOLVE_OPTIONS,
-            alias: false,
-          }
-          const ESM_RESOLVE_OPTIONS = {
-            ...NODE_ESM_RESOLVE_OPTIONS,
-            fullySpecified: undefined,
-            modules: undefined,
-            extensions: undefined,
-          }
-          const BASE_ESM_RESOLVE_OPTIONS = {
-            ...ESM_RESOLVE_OPTIONS,
-            alias: false,
-          }
-
-          const doResolve = async (
-            request: string,
-            parent: string,
-            job: import('@vercel/nft/out/node-file-trace').Job,
-            isEsmRequested: boolean
-          ): Promise<string> => {
-            const context = nodePath.dirname(parent)
-            // When in esm externals mode, and using import, we resolve with
-            // ESM resolving options.
-            const { res } = await resolveExternal(
-              this.rootDir,
-              this.esmExternals,
-              context,
-              request,
-              isEsmRequested,
-              (options) => (_: string, resRequest: string) => {
-                return getResolve(options)(parent, resRequest, job)
-              },
-              undefined,
-              undefined,
-              ESM_RESOLVE_OPTIONS,
-              CJS_RESOLVE_OPTIONS,
-              BASE_ESM_RESOLVE_OPTIONS,
-              BASE_CJS_RESOLVE_OPTIONS
-            )
-
-            if (!res) {
-              throw new Error(`failed to resolve ${request} from ${parent}`)
-            }
-            return res.replace(/\0/g, '')
-          }
-
-          this.tapfinishModules(
-            compilation,
-            traceEntrypointsPluginSpan,
-            doResolve,
-            readlink,
-            stat
-          )
+                  resolve([result, options.dependencyType === 'esm'])
+                }
+              )
+            })
         }
+
+        const CJS_RESOLVE_OPTIONS = {
+          ...NODE_RESOLVE_OPTIONS,
+          fullySpecified: undefined,
+          modules: undefined,
+          extensions: undefined,
+        }
+        const BASE_CJS_RESOLVE_OPTIONS = {
+          ...CJS_RESOLVE_OPTIONS,
+          alias: false,
+        }
+        const ESM_RESOLVE_OPTIONS = {
+          ...NODE_ESM_RESOLVE_OPTIONS,
+          fullySpecified: undefined,
+          modules: undefined,
+          extensions: undefined,
+        }
+        const BASE_ESM_RESOLVE_OPTIONS = {
+          ...ESM_RESOLVE_OPTIONS,
+          alias: false,
+        }
+
+        const doResolve = async (
+          request: string,
+          parent: string,
+          job: import('@vercel/nft/out/node-file-trace').Job,
+          isEsmRequested: boolean
+        ): Promise<string> => {
+          const context = nodePath.dirname(parent)
+          // When in esm externals mode, and using import, we resolve with
+          // ESM resolving options.
+          const { res } = await resolveExternal(
+            this.rootDir,
+            this.esmExternals,
+            context,
+            request,
+            isEsmRequested,
+            (options) => (_: string, resRequest: string) => {
+              return getResolve(options)(parent, resRequest, job)
+            },
+            undefined,
+            undefined,
+            ESM_RESOLVE_OPTIONS,
+            CJS_RESOLVE_OPTIONS,
+            BASE_ESM_RESOLVE_OPTIONS,
+            BASE_CJS_RESOLVE_OPTIONS
+          )
+
+          if (!res) {
+            throw new Error(`failed to resolve ${request} from ${parent}`)
+          }
+          return res.replace(/\0/g, '')
+        }
+
+        this.tapfinishModules(
+          compilation,
+          traceEntrypointsPluginSpan,
+          doResolve,
+          readlink,
+          stat
+        )
+      }
+      traceLocalSpan(
+        { span: traceEntrypointsPluginSpan, synchronous: true },
+        setupTraceEntrypoints
       )
     })
   }
