@@ -9,9 +9,6 @@ const { linkPackages } = require('./link-packed-packages')
 const lockfile = require('proper-lockfile')
 const yaml = require('js-yaml')
 const {
-  traceLocalSpan,
-} = require('next/dist/server/lib/trace/local-span-recorder')
-const {
   getPnpmSecuritySettings,
   mergeSettingsIntoYaml,
   getYarnSecuritySettings,
@@ -281,6 +278,9 @@ async function lockfileResolvesLocalTarball(
  * @returns {Promise<Map<string, string>>}
  */
 async function packPackages(parentSpan) {
+  const {
+    traceLocalSpan,
+  } = require('next/dist/server/lib/trace/local-span-recorder')
   const repositoryDirectory = await fs.realpath(path.join(__dirname, '../..'))
   const cacheDir = path.join(repositoryDirectory, '.turbo')
   await fs.ensureDir(cacheDir)
@@ -341,6 +341,10 @@ async function createNextInstall({
   subDir = '',
   beforeInstall,
 }) {
+  // The test runner imports this module to fetch timings before Next is built.
+  const {
+    traceLocalSpan,
+  } = require('next/dist/server/lib/trace/local-span-recorder')
   const tmpDir = await fs.realpath(process.env.NEXT_TEST_DIR || os.tmpdir())
 
   return await traceLocalSpan(
