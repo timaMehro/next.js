@@ -260,7 +260,6 @@ export function recordTraceEvents(
   events: TraceEvent[],
   selections?: readonly ToolingSpanSelection[]
 ) {
-  if (otel) events = otel.freshWorkerEvents(events)
   for (const traceEvent of events) {
     traceEvent.tags = normalizeToolingAttributes(traceEvent.tags)
     reportToolingSpans([traceEvent])

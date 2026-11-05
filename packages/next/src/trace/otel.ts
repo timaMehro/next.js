@@ -57,14 +57,6 @@ export function configureState(
   configureReporting(parentId, worker)
 }
 
-let importedThrough = 0
-export function freshWorkerEvents(events: TraceEvent[]) {
-  const fresh = events.filter((event) => event.id > importedThrough)
-  for (const event of fresh)
-    importedThrough = Math.max(importedThrough, event.id)
-  return fresh
-}
-
 export function replayWorkerEvents(
   events: TraceEvent[],
   selections: readonly ToolingSpanSelection[] = []

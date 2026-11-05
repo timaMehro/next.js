@@ -40,7 +40,10 @@ let finalization: Promise<void> | undefined
 // captures after the active SDK call returns, without recursively entering it.
 let reporting = false
 let reentered = false
-const records = new Map<number, ReportingRecord>()
+const records = new Set<ReportingRecord>()
+// Compiler workers allocate IDs independently. They share retention accounting,
+// but must not replace coordinator records used for numeric parent lookup.
+const coordinatorRecords = new Map<number, ReportingRecord>()
 
 function warnLoss() {
   if (!warned) {
@@ -78,7 +81,9 @@ function release(record: ReportingRecord) {
   if (record.retained) {
     record.retained = false
     retainedBytes -= record.size
-    if (records.get(record.id) === record) records.delete(record.id)
+    records.delete(record)
+    if (coordinatorRecords.get(record.id) === record)
+      coordinatorRecords.delete(record.id)
   }
   record.name = ''
   record.encoded = undefined
@@ -252,14 +257,14 @@ function retain(
     parent: root
       ? undefined
       : (parent ??
-        records.get(parentId!) ??
+        coordinatorRecords.get(parentId!) ??
         (parentId === undefined ? undefined : defaultParent)),
     retained: true,
     size,
     generation,
   }
   retainedBytes += size
-  records.set(id, record)
+  records.add(record)
   if (root) defaultParent = record
   return record
 }
@@ -268,7 +273,10 @@ export function startReporting(
   ...args: Parameters<typeof retain>
 ): ReportingRecord | undefined {
   const record = retain(...args)
-  if (record) report([record])
+  if (record) {
+    coordinatorRecords.set(record.id, record)
+    report([record])
+  }
   return record
 }
 
@@ -315,7 +323,7 @@ export function configureReporting(
   parentId: number | undefined,
   worker: boolean
 ) {
-  defaultParent = records.get(parentId!) ?? defaultParent
+  defaultParent = coordinatorRecords.get(parentId!) ?? defaultParent
   suppressed = worker
   if (worker) clearWork()
 }
@@ -347,7 +355,7 @@ export function replayCompleted(
   for (const record of batch.values()) {
     record.parent =
       batch.get(parents.get(record.id)!) ??
-      records.get(parents.get(record.id)!) ??
+      coordinatorRecords.get(parents.get(record.id)!) ??
       defaultParent
   }
   report(batch.values())

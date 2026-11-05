@@ -270,6 +270,63 @@ describe('experimental tooling OTel', () => {
     })
   })
 
+  // Separate compiler workers and their local files are Webpack build contracts.
+  // @force-gate start && webpack
+  describe('parallel compiler replay', () => {
+    const { next } = nextTestSetup({
+      files: __dirname,
+      skipStart: true,
+      dependencies,
+      env: { NEXT_EXPERIMENTAL_OTEL_TOOLING: '1', TOOLING_SAMPLER: 'on' },
+    })
+    const messages: Message[] = []
+    let collector: Server
+
+    beforeAll(async () => {
+      collector = await startCollector(messages)
+      next.env.TOOLING_ENDPOINT = `http://127.0.0.1:${(collector.address() as { port: number }).port}`
+      next.env.TOOLING_TRACE_FILE = join('otel-output', 'trace')
+    })
+    afterAll(async () => {
+      await new Promise<void>((resolve) => collector?.close(() => resolve()))
+    })
+
+    it('retains both parallel worker results locally and in the application provider', async () => {
+      await next.patchFile('next.config.ts', (source) =>
+        source.replace(
+          "distDir: 'otel-output'",
+          "distDir: 'otel-output', experimental: { webpackBuildWorker: true, parallelServerCompiles: true }"
+        )
+      )
+      await next.patchFile(
+        'app/edge/route.ts',
+        "export const runtime = 'edge'; export function GET() { return new Response('edge') }"
+      )
+      expect((await next.build()).exitCode).toBe(0)
+      const local = parseTraceFile(
+        join(next.testDir, next.env.TOOLING_TRACE_FILE)
+      ).events
+      const exported = messages.flatMap((message) => message.spans ?? [])
+      const root = exported.find((span) => span.name === 'next-build')!
+      expect(root).toBeDefined()
+      for (const compiler of ['server', 'edge-server', 'client']) {
+        const name = `worker-main-${compiler}`
+        const events = local.filter((event) => event.name === name)
+        const spans = exported.filter((span) => span.name === name)
+        expect(events).toHaveLength(1)
+        expect(spans).toHaveLength(1)
+        expect(spans[0].traceId).toBe(root.traceId)
+        expect(spans[0].parentSpanId).toBe(root.spanId)
+        expect(spans[0].attributes['next.tooling.id']).toBe(events[0].id)
+        expect(spans[0].attributes['next.tooling.parent_id']).toBe(
+          events[0].parentId
+        )
+      }
+      // Legacy numeric IDs can overlap across parallel workers. Correlate each
+      // result by its compiler name rather than pretending IDs are global.
+    })
+  })
+
   // A webpack config hook has no equivalent execution path in Turbopack.
   // @force-gate start && webpack
   describe('compiler setup failure', () => {

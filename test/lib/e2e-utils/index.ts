@@ -297,50 +297,24 @@ async function createNext(
         ? false
         : (opts?.turbo ?? shouldUseTurbopack())
 
-      if (testMode === 'dev') {
-        // next dev
-        traceLocalSpan(
-          {
-            name: 'init next dev instance',
-            parent: rootSpan,
-            synchronous: true,
-          },
-          () => {
-            nextInstance = new NextDevInstance({
-              ...opts,
-              turbo: useTurbo,
-            })
+      const mode =
+        testMode === 'dev' ? 'dev' : testMode === 'deploy' ? 'deploy' : 'start'
+      traceLocalSpan(
+        {
+          name: `init next ${mode} instance`,
+          parent: rootSpan,
+          synchronous: true,
+        },
+        () => {
+          if (mode === 'dev') {
+            nextInstance = new NextDevInstance({ ...opts, turbo: useTurbo })
+          } else if (mode === 'deploy') {
+            nextInstance = new NextDeployInstance({ ...opts })
+          } else {
+            nextInstance = new NextStartInstance({ ...opts })
           }
-        )
-      } else if (testMode === 'deploy') {
-        // Vercel
-        traceLocalSpan(
-          {
-            name: 'init next deploy instance',
-            parent: rootSpan,
-            synchronous: true,
-          },
-          () => {
-            nextInstance = new NextDeployInstance({
-              ...opts,
-            })
-          }
-        )
-      } else {
-        // next build + next start
-        traceLocalSpan(
-          {
-            name: 'init next start instance',
-            parent: rootSpan,
-            synchronous: true,
-          },
-          () => {
-            nextInstance = new NextStartInstance({
-              ...opts,
-            })
-          }
-        )
-      }
+        }
+      )
 
       nextInstance = nextInstance!
 

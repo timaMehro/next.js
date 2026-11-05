@@ -134,6 +134,57 @@ describe('tooling OTel safety', () => {
     )
   })
 
+  it('retains out-of-order worker results without replacing a live coordinator parent', () => {
+    const { recordTraceEvents } = require('../../packages/next/src/trace/trace')
+    const {
+      getToolingSpanSource,
+    } = require('../../packages/next/src/server/lib/trace/local-span-recorder')
+    const root = tracer.startSpan(types.ToolingSpan.nextBuild, {})
+    const parent = child('live-coordinator', root)
+    const parentId = getToolingSpanSource(parent).id
+    const rootId = getToolingSpanSource(root).id
+    installProvider()
+    backend.enableReporting()
+    // Parallel workers inherit snapshots of the coordinator counter. Their
+    // completion order and overlapping IDs must not filter distinct results.
+    for (const id of [100, parentId]) {
+      recordTraceEvents(
+        [
+          {
+            id,
+            parentId: rootId,
+            name: `worker-${id}`,
+            timestamp: 1,
+            duration: 1,
+          },
+        ],
+        [{ id, parentId: rootId }]
+      )
+    }
+    expect(local.map((event) => event.name)).toEqual([
+      'worker-100',
+      `worker-${parentId}`,
+    ])
+    tracer
+      .startSpan(types.ToolingSpan.runWebpackCompiler, {
+        spanName: 'numeric-child',
+        parent: parentId,
+      })
+      .end()
+    parent.end()
+    root.end()
+    expect(exported.map((span) => span.name)).toEqual([
+      'worker-100',
+      `worker-${parentId}`,
+      'numeric-child',
+      'live-coordinator',
+      'next-build',
+    ])
+    expect(exported[2].parentSpanContext?.spanId).toBe(
+      exported[3].spanContext().spanId
+    )
+  })
+
   it('bounds a hanging flush hook and clears its timeout', async () => {
     jest.useFakeTimers()
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {})
